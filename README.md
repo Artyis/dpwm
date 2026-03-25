@@ -8,7 +8,7 @@ of Physical and Linguistic Embeddings"
 pip install torch numpy
 
 ## Run
-python dual_plane_prototype.py
+python dpwm.py
 
 ## Key idea
 combined = physics_vec + lang_vec
