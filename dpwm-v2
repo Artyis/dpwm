@@ -1,0 +1,798 @@
+import json
+import os
+import random
+import warnings
+from pickle import FALSE
+
+warnings.filterwarnings("ignore")
+
+import cv2
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+from transformers import AutoModel, AutoTokenizer, BertTokenizer
+
+# ─── Конфиг ───────────────────────────────────────────────────────────────────
+PROJ_DIM = 128  # размер общего пространства (меньше = быстрее на GTX 1650)
+NUM_HEADS = 4  # голов в Multi-Cross Attention
+HEAD_DIM = PROJ_DIM // NUM_HEADS  # = 32
+EPOCHS = 15
+LR = 1e-4
+BATCH_SIZE = 4  # маленький батч из-за видео в памяти
+NUM_FRAMES = 4  # кадров из каждого видео (меньше = быстрее)
+FRAME_SIZE = 112  # размер кадра (112 вместо 224 = в 4 раза меньше памяти)
+MAX_SAMPLES = 2000  # начинаем с 500 видео для быстрой проверки
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+SAVE_PATH = "./checkpoints"
+DATA_DIR = "./"
+WEIGHTS_DIR = "./"
+
+# Классы UCF-101 с физическими действиями + текстовые описания
+CLASS_TO_TEXT = {
+    "ThrowDiscus": "person throwing a disc with force",
+    "Bowling": "person rolling a ball toward pins",
+    "BaseballPitch": "person throwing a baseball fast",
+    "Basketball": "person throwing a basketball into a hoop",
+    "CliffDiving": "person diving off a cliff into water",
+    "Diving": "person diving into a pool",
+    "GolfSwing": "person swinging a golf club",
+    "HammerThrow": "person throwing a heavy hammer",
+    "HighJump": "person jumping over a high bar",
+    "JavelinThrow": "person throwing a javelin spear",
+    "LongJump": "person jumping as far as possible",
+    "Shotput": "person throwing a heavy metal ball",
+    "Archery": "person shooting an arrow from a bow",
+    "Billiards": "person hitting billiard balls with a cue",
+    "BoxingPunchingBag": "person punching a heavy bag",
+    "PushUps": "person pushing body up from the ground",
+    "JumpingJack": "person jumping with arms and legs spread",
+    "CricketBowling": "person bowling a cricket ball",
+    "IceDancing": "person skating and spinning on ice",
+    "SoccerJuggling": "person juggling a soccer ball",
+}
+
+# Случайные тексты для эксперимента 2 — намеренно несвязанные с физикой
+RANDOM_TEXTS = [
+    "the weather is sunny today",
+    "cooking pasta with tomato sauce",
+    "reading a book in the library",
+    "playing chess with a friend",
+    "listening to music on headphones",
+    "writing code on a computer",
+    "painting a picture on canvas",
+    "drinking coffee in the morning",
+]
+
+print("=" * 60)
+print(f"  Устройство: {DEVICE}")
+if DEVICE == "cuda":
+    print(f"  GPU: {torch.cuda.get_device_name(0)}")
+    vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+    print(f"  VRAM: {vram:.1f} GB")
+else:
+    print("  ВНИМАНИЕ: GPU не найден, CPU будет очень медленным")
+print("=" * 60)
+
+
+# ─── Подготовка данных ────────────────────────────────────────────────────────
+
+
+def prepare_annotations():
+    """Создаёт annotations.json из видеофайлов UCF-101."""
+    out_file = os.path.join(DATA_DIR, "annotations.json")
+
+    if os.path.exists(out_file):
+        with open(out_file) as f:
+            data = json.load(f)
+        print(f"  Аннотации загружены: {len(data)} видео")
+        return out_file
+
+    video_dir = os.path.join(DATA_DIR, "UCF-101")
+    if not os.path.exists(video_dir):
+        raise FileNotFoundError(
+            f"Папка {video_dir} не найдена!\nРаспакуй UCF-101 в {video_dir}"
+        )
+
+    annotations = []
+    found_classes = []
+    for class_name, text in CLASS_TO_TEXT.items():
+        class_dir = os.path.join(video_dir, class_name)
+        if not os.path.exists(class_dir):
+            continue
+        found_classes.append(class_name)
+        for video_file in sorted(os.listdir(class_dir)):
+            if video_file.endswith(".avi"):
+                annotations.append(
+                    {
+                        "video": os.path.join(class_dir, video_file),
+                        "text": text,
+                        "class": class_name,
+                    }
+                )
+
+    if not annotations:
+        raise ValueError(
+            f"Видео не найдены в {video_dir}!\n"
+            f"Ожидаемые классы: {list(CLASS_TO_TEXT.keys())}"
+        )
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(out_file, "w") as f:
+        json.dump(annotations, f, indent=2)
+
+    print(f"  Классов найдено: {len(found_classes)}")
+    print(f"  Аннотаций создано: {len(annotations)}")
+    return out_file
+
+
+class UCFDataset(Dataset):
+    """
+    Загружает видео UCF-101 и возвращает пары кадров:
+    - frames:      первые NUM_FRAMES кадров (текущее состояние)
+    - next_frames: следующие NUM_FRAMES кадров (цель предсказания)
+    - text:        текстовое описание действия
+    """
+
+    def __init__(self, annotations_file, max_samples=None):
+        with open(annotations_file) as f:
+            self.data = json.load(f)
+        if max_samples:
+            # Равномерная выборка по классам
+            random.shuffle(self.data)
+            self.data = self.data[:max_samples]
+        print(f"  Датасет: {len(self.data)} примеров")
+
+    def __len__(self):
+        return len(self.data)
+
+    def _load_frames(self, path):
+        """Загружает NUM_FRAMES*2 кадров из видео."""
+        if not os.path.exists(path):
+            # Возвращаем нулевые кадры если файл не найден
+            return [torch.zeros(3, FRAME_SIZE, FRAME_SIZE)] * (NUM_FRAMES * 2)
+
+        cap = cv2.VideoCapture(path)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        total = max(total, NUM_FRAMES * 2 + 1)
+        step = max(total // (NUM_FRAMES * 2), 1)
+
+        frames = []
+        for i in range(NUM_FRAMES * 2):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, i * step)
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                frame = cv2.resize(
+                    cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), (FRAME_SIZE, FRAME_SIZE)
+                )
+                # Нормализация [0, 1]
+                tensor = (
+                    torch.tensor(frame, dtype=torch.float32).permute(2, 0, 1) / 255.0
+                )
+            else:
+                tensor = torch.zeros(3, FRAME_SIZE, FRAME_SIZE)
+            frames.append(tensor)
+        cap.release()
+
+        # Дополняем если кадров не хватило
+        while len(frames) < NUM_FRAMES * 2:
+            frames.append(frames[-1].clone())
+
+        return frames
+
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        frames = self._load_frames(item["video"])
+        return {
+            "frames": torch.stack(frames[:NUM_FRAMES]),  # [N, C, H, W]
+            "next_frames": torch.stack(frames[NUM_FRAMES:]),  # [N, C, H, W]
+            "text": item["text"],
+            "class": item["class"],
+        }
+
+
+# ─── Энкодеры ─────────────────────────────────────────────────────────────────
+
+
+class PhysicsEncoder(nn.Module):
+    """
+    DINO-v2 ViT-Small как физический энкодер.
+    Загружает веса локально из ./weights/dinov2_vits14_pretrain.pth
+    Заморожен — обучаем только проекционный слой.
+
+    Выход: [B, PROJ_DIM]
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # Загружаем DINO-v2 ViT-Small
+        self.dino = torch.hub.load(
+            "facebookresearch/dinov2",
+            "dinov2_vits14",
+            pretrained=False,  # НЕ скачиваем из интернета
+            verbose=False,
+        )
+
+        # Загружаем веса локально
+        weights_path = os.path.join(WEIGHTS_DIR, "dinov2_vits14_pretrain.pth")
+        if not os.path.exists(weights_path):
+            raise FileNotFoundError(
+                f"Веса DINO-v2 не найдены: {weights_path}\n"
+                f"Скачай: https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_pretrain.pth"
+            )
+
+        state_dict = torch.load(weights_path, map_location="cpu")
+        self.dino.load_state_dict(state_dict, strict=False)
+        print(f"  DINO-v2 веса загружены: {weights_path}")
+
+        # Замораживаем — не обучаем
+        for p in self.dino.parameters():
+            p.requires_grad = False
+
+        dino_out_dim = 384  # ViT-Small output
+
+        # Проекционный слой — единственное что обучается в энкодере
+        self.proj = nn.Sequential(
+            nn.Linear(dino_out_dim, PROJ_DIM),
+            nn.LayerNorm(PROJ_DIM),
+            nn.GELU(),
+        )
+
+    def forward(self, frames):
+        # frames: [B, N, C, H, W]
+        B, N, C, H, W = frames.shape
+
+        # Обрабатываем все кадры батчем
+        frames_flat = frames.view(B * N, C, H, W)  # [B*N, C, H, W]
+
+        with torch.no_grad():
+            # DINO-v2 ожидает [B, C, H, W] и возвращает [B, 384]
+            feats = self.dino(frames_flat)  # [B*N, 384]
+
+        # Усредняем по кадрам для получения единого физического вектора
+        feats = feats.view(B, N, -1).mean(dim=1)  # [B, 384]
+        return self.proj(feats)  # [B, PROJ_DIM]
+
+
+class LanguageEncoder(nn.Module):
+    """
+    BERT-tiny как языковой энкодер.
+    Скачивается с HuggingFace автоматически (~17MB).
+    Заморожен — обучаем только проекционный слой.
+
+    Выход: [B, PROJ_DIM]
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        model_name = "./bert-tiny-local"
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.bert = AutoModel.from_pretrained(model_name)
+        print(f"  BERT-tiny загружен")
+
+        # Замораживаем
+        for p in self.bert.parameters():
+            p.requires_grad = False
+
+        bert_out_dim = 128  # BERT-tiny hidden size
+
+        self.proj = nn.Sequential(
+            nn.Linear(bert_out_dim, PROJ_DIM),
+            nn.LayerNorm(PROJ_DIM),
+            nn.GELU(),
+        )
+
+    def forward(self, texts):
+        # texts: список строк длиной B
+        tokens = self.tokenizer(
+            list(texts),
+            padding=True,
+            truncation=True,
+            max_length=32,
+            return_tensors="pt",
+        ).to(DEVICE)
+
+        with torch.no_grad():
+            out = self.bert(**tokens)
+
+        # CLS токен как представление всего текста
+        cls = out.last_hidden_state[:, 0, :]  # [B, 128]
+        return self.proj(cls)  # [B, PROJ_DIM]
+
+
+# ─── Multi-Cross Attention ────────────────────────────────────────────────────
+
+
+class MultiCrossAttention(nn.Module):
+    """
+    Симметричный двунаправленный cross-attention.
+
+    mode="alternating":
+      Чётные головы:   Physics  → Query, Language → K, V
+      Нечётные головы: Language → Query, Physics  → K, V
+      ↑ ЭТО ОСНОВНАЯ ГИПОТЕЗА
+
+    mode="phys_query":
+      Все головы: Physics → Query, Language → K, V
+
+    mode="lang_query":
+      Все головы: Language → Query, Physics → K, V
+
+    Выход: [B, PROJ_DIM]
+    """
+
+    def __init__(self, mode="alternating"):
+        super().__init__()
+        assert mode in ("alternating", "phys_query", "lang_query"), (
+            f"Неверный mode: {mode}"
+        )
+
+        self.mode = mode
+        self.scale = HEAD_DIM**-0.5
+
+        # Проекции для физики
+        self.Pq = nn.Linear(PROJ_DIM, PROJ_DIM)
+        self.Pk = nn.Linear(PROJ_DIM, PROJ_DIM)
+        self.Pv = nn.Linear(PROJ_DIM, PROJ_DIM)
+
+        # Проекции для языка
+        self.Lq = nn.Linear(PROJ_DIM, PROJ_DIM)
+        self.Lk = nn.Linear(PROJ_DIM, PROJ_DIM)
+        self.Lv = nn.Linear(PROJ_DIM, PROJ_DIM)
+
+        self.out_proj = nn.Linear(PROJ_DIM, PROJ_DIM)
+        self.norm = nn.LayerNorm(PROJ_DIM)
+
+    def forward(self, p, l):
+        # p, l: [B, PROJ_DIM]
+        B = p.shape[0]
+
+        # Разбиваем на головы [B, NUM_HEADS, HEAD_DIM]
+        pq = self.Pq(p).view(B, NUM_HEADS, HEAD_DIM)
+        pk = self.Pk(p).view(B, NUM_HEADS, HEAD_DIM)
+        pv = self.Pv(p).view(B, NUM_HEADS, HEAD_DIM)
+        lq = self.Lq(l).view(B, NUM_HEADS, HEAD_DIM)
+        lk = self.Lk(l).view(B, NUM_HEADS, HEAD_DIM)
+        lv = self.Lv(l).view(B, NUM_HEADS, HEAD_DIM)
+
+        heads = []
+        for h in range(NUM_HEADS):
+            # Определяем направление Query для каждой головы
+            if self.mode == "alternating":
+                phys_as_query = h % 2 == 0
+            elif self.mode == "phys_query":
+                phys_as_query = True
+            else:  # lang_query
+                phys_as_query = False
+
+            if phys_as_query:
+                # Физика спрашивает язык
+                q, k, v = pq[:, h, :], lk[:, h, :], lv[:, h, :]
+            else:
+                # Язык спрашивает физику
+                q, k, v = lq[:, h, :], pk[:, h, :], pv[:, h, :]
+
+            # Скалярное произведение → вес → взвешенная сумма
+            w = torch.sigmoid((q * k).sum(-1, keepdim=True) * self.scale)
+            heads.append(w * v)  # [B, HEAD_DIM]
+
+        # Конкатенируем головы [B, PROJ_DIM]
+        out = self.out_proj(torch.cat(heads, dim=-1))
+
+        # Residual: combined содержит и p и l через сложение
+        # Это ключевое для обратимости: combined = f(p,l) + p + l
+        return self.norm(out + p + l)
+
+
+class Decoder(nn.Module):
+    """
+    Декодер для восстановления плоскости из разности.
+    Используется для:
+    - physics_dec: (combined - lang) → next_physics
+    - lang_dec:    (combined - phys) → lang
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(PROJ_DIM, PROJ_DIM * 2),
+            nn.LayerNorm(PROJ_DIM * 2),
+            nn.GELU(),
+            nn.Linear(PROJ_DIM * 2, PROJ_DIM),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class DualPlaneWorldModel(nn.Module):
+    """
+    Полная модель.
+
+    Прямой проход:
+      p        = PhysicsEncoder(frames)      # текущая физика
+      p_nxt    = PhysicsEncoder(next_frames) # следующая физика (цель)
+      l        = LanguageEncoder(texts)
+      combined = MCA(p, l)                   # объединённое представление
+
+    Лоссы:
+      L1 = MSE(physics_dec(combined),       p_nxt)  # предсказание из combined
+      L2 = MSE(physics_dec(combined - l),   p_nxt)  # предсказание БЕЗ языка
+      L3 = MSE(lang_dec(combined - p),      l)      # восстановление языка
+
+    L2 — ключевой лосс для проверки гипотезы:
+    модель должна предсказывать физику без языкового контекста.
+    """
+
+    def __init__(self, mode="alternating"):
+        super().__init__()
+        self.physics_enc = PhysicsEncoder()
+        self.lang_enc = LanguageEncoder()
+        self.mca = MultiCrossAttention(mode=mode)
+        self.physics_dec = Decoder()
+        self.lang_dec = Decoder()
+
+    def forward(self, frames, next_frames, texts):
+        p = self.physics_enc(frames)
+        p_nxt = self.physics_enc(next_frames)
+        l = self.lang_enc(texts)
+        combined = self.mca(p, l)
+        return p, l, combined, p_nxt
+
+
+# ─── Обучение одной модели ────────────────────────────────────────────────────
+
+
+def train_model(mode, loader):
+    """Обучает модель с заданным режимом голов."""
+    print(f"\n  Обучение режима: [{mode}]")
+    print("-" * 55)
+
+    model = DualPlaneWorldModel(mode=mode).to(DEVICE)
+    optimizer = optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad], lr=LR, weight_decay=1e-4
+    )
+    mse = nn.MSELoss()
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"  Параметров обучаемых: {trainable:,} / всего: {total:,}")
+
+    best_loss = float("inf")
+    os.makedirs(SAVE_PATH, exist_ok=True)
+
+    for epoch in range(EPOCHS):
+        model.train()
+        sum_L1 = sum_L2 = sum_L3 = 0.0
+
+        pbar = tqdm(loader, desc=f"  Эпоха {epoch + 1:2d}/{EPOCHS}", leave=False)
+        for batch in pbar:
+            frames = batch["frames"].to(DEVICE)  # [B, N, C, H, W]
+            next_frames = batch["next_frames"].to(DEVICE)
+            texts = batch["text"]
+
+            p, l, combined, p_nxt = model(frames, next_frames, texts)
+
+            # Три лосса — ядро проверки гипотезы
+            L1 = mse(model.physics_dec(combined), p_nxt.detach())
+            L2 = mse(model.physics_dec(combined - l.detach()), p_nxt.detach())
+            L3 = mse(model.lang_dec(combined - p.detach()), l.detach())
+            loss = L1 + L2 + L3
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+            sum_L1 += L1.item()
+            sum_L2 += L2.item()
+            sum_L3 += L3.item()
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+        n = len(loader)
+        avg_loss = (sum_L1 + sum_L2 + sum_L3) / n
+        print(
+            f"  Эпоха {epoch + 1:2d} | "
+            f"L1(combined→phys): {sum_L1 / n:.4f} | "
+            f"L2(no-lang→phys):  {sum_L2 / n:.4f} | "
+            f"L3(no-phys→lang):  {sum_L3 / n:.4f}"
+        )
+
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            torch.save(model.state_dict(), f"{SAVE_PATH}/model_{mode}.pt")
+
+    print(f"  Лучший loss: {best_loss:.4f} → сохранён: {SAVE_PATH}/model_{mode}.pt")
+    return model
+
+
+# ─── Эксперимент 1: Head Symmetry Ablation ────────────────────────────────────
+
+
+def experiment_1(loader):
+    """
+    Проверяем что чередование направлений Query даёт лучшие результаты
+    чем одностороннее внимание.
+
+    Ожидание: alternating ≤ phys_query и alternating ≤ lang_query
+    """
+    print("\n" + "=" * 60)
+    print("  ЭКСПЕРИМЕНТ 1: Head Symmetry Ablation")
+    print("  Вопрос: важно ли симметричное направление голов?")
+    print("=" * 60)
+
+    results = {}
+    mse = nn.MSELoss()
+
+    for mode in ["alternating", "lang_query", "phys_query"]:
+        model = train_model(mode, loader)
+        model.eval()
+
+        p_errs, r_errs = [], []
+        with torch.no_grad():
+            for batch in loader:
+                frames = batch["frames"].to(DEVICE)
+                next_frames = batch["next_frames"].to(DEVICE)
+                texts = batch["text"]
+
+                p, l, combined, p_nxt = model(frames, next_frames, texts)
+
+                # Physics prediction error — насколько хорошо предсказывает физику
+                p_errs.append(mse(model.physics_dec(combined), p_nxt).item())
+
+                # Recovery error — насколько хорошо восстанавливает физику БЕЗ языка
+                r_errs.append(mse(model.physics_dec(combined - l), p_nxt).item())
+
+        results[mode] = {
+            "physics_error": sum(p_errs) / len(p_errs),
+            "recovery_error": sum(r_errs) / len(r_errs),
+        }
+
+    # Вывод результатов
+    print("\n  Результаты:")
+    print(f"  {'Режим':<15} {'Physics Error':>15} {'Recovery Error':>15}")
+    print("-" * 50)
+    for mode, r in results.items():
+        tag = "  ← основная гипотеза" if mode == "alternating" else ""
+        print(
+            f"  {mode:<15} "
+            f"{r['physics_error']:>15.4f} "
+            f"{r['recovery_error']:>15.4f}"
+            f"{tag}"
+        )
+
+    best = min(results, key=lambda m: results[m]["recovery_error"])
+    print(f"\n  Лучший режим по recovery: [{best}]")
+    if best == "alternating":
+        print("  ✓ Симметричные головы лучше одностороннего подхода!")
+    else:
+        print(f"  ~ Лучший режим: {best} — стоит проанализировать почему")
+
+    return results
+
+
+# ─── Эксперимент 2: Language Corruption Test ──────────────────────────────────
+
+
+def experiment_2(model, loader):
+    """
+    Проверяем что физическое предсказание устойчиво к шуму в языке.
+
+    Логика: если combined = physics + language,
+    то при правильной обратимости физика должна
+    восстанавливаться даже при плохом языковом векторе.
+
+    Ожидание:
+    - случайный текст:  деградация < 30%
+    - шум в эмбеддинге: деградация < 30%
+    """
+    print("\n" + "=" * 60)
+    print("  ЭКСПЕРИМЕНТ 2: Language Corruption Test")
+    print("  Вопрос: устойчива ли физика к шуму в языке?")
+    print("=" * 60)
+
+    mse = nn.MSELoss()
+    model.eval()
+
+    def eval_error(text_fn=None, noise_scale=None):
+        """Вычисляет ошибку предсказания физики."""
+        errs = []
+        with torch.no_grad():
+            for batch in loader:
+                frames = batch["frames"].to(DEVICE)
+                next_frames = batch["next_frames"].to(DEVICE)
+
+                if noise_scale is not None:
+                    # Шум напрямую в эмбеддинг языка
+                    texts = batch["text"]
+                    p, l, _, p_nxt = model(frames, next_frames, texts)
+                    l_noisy = l + torch.randn_like(l) * noise_scale
+                    combined = model.mca(p, l_noisy)
+                else:
+                    texts = text_fn(batch)
+                    p, l, combined, p_nxt = model(frames, next_frames, texts)
+
+                pred = model.physics_dec(combined)
+                errs.append(mse(pred, p_nxt).item())
+        return sum(errs) / len(errs)
+
+    err_original = eval_error(text_fn=lambda b: b["text"])
+    err_random = eval_error(
+        text_fn=lambda b: [random.choice(RANDOM_TEXTS) for _ in b["text"]]
+    )
+    err_noise = eval_error(noise_scale=0.5)
+
+    deg_random = ((err_random / err_original) - 1) * 100
+    deg_noise = ((err_noise / err_original) - 1) * 100
+
+    print(f"\n  Оригинальный текст:  {err_original:.4f}  (baseline)")
+    print(f"  Случайный текст:     {err_random:.4f}  (деградация: {deg_random:+.1f}%)")
+    print(f"  Шум в эмбеддинге:    {err_noise:.4f}  (деградация: {deg_noise:+.1f}%)")
+
+    print()
+    if deg_random < 30:
+        print("  ✓ Устойчива к случайному тексту — физика не зависит от языка!")
+    else:
+        print("  ~ Чувствительна к тексту — возможно нужно больше эпох")
+
+    if deg_noise < 30:
+        print("  ✓ Устойчива к шуму в эмбеддинге!")
+    else:
+        print("  ~ Чувствительна к шуму в эмбеддинге")
+
+    return {
+        "original": err_original,
+        "random": err_random,
+        "noise": err_noise,
+        "deg_random": deg_random,
+        "deg_noise": deg_noise,
+    }
+
+
+# ─── Эксперимент 3: Zero-language Inference ───────────────────────────────────
+
+
+def experiment_3(model, loader):
+    """
+    Зануляем языковой вектор полностью.
+    Это самый прямой тест гипотезы:
+    если combined - language = physics,
+    то combined - zeros = combined,
+    и модель должна восстановить физику из combined без языка.
+
+    Ожидание: деградация < 30%
+    """
+    print("\n" + "=" * 60)
+    print("  ЭКСПЕРИМЕНТ 3: Zero-language Inference")
+    print("  Вопрос: работает ли физика без языка вообще?")
+    print("=" * 60)
+
+    mse = nn.MSELoss()
+    model.eval()
+
+    with_errs = []
+    zero_errs = []
+
+    with torch.no_grad():
+        for batch in loader:
+            frames = batch["frames"].to(DEVICE)
+            next_frames = batch["next_frames"].to(DEVICE)
+            texts = batch["text"]
+
+            p, l, combined, p_nxt = model(frames, next_frames, texts)
+
+            # Стандартное предсказание
+            pred_with = model.physics_dec(combined)
+            with_errs.append(mse(pred_with, p_nxt).item())
+
+            # Зануляем язык
+            l_zero = torch.zeros_like(l)
+            combined_zero = model.mca(p, l_zero)
+            pred_zero = model.physics_dec(combined_zero)
+            zero_errs.append(mse(pred_zero, p_nxt).item())
+
+    avg_with = sum(with_errs) / len(with_errs)
+    avg_zero = sum(zero_errs) / len(zero_errs)
+    deg = ((avg_zero / avg_with) - 1) * 100
+
+    print(f"\n  С языком:    {avg_with:.4f}")
+    print(f"  Без языка:   {avg_zero:.4f}")
+    print(f"  Деградация:  {deg:+.1f}%")
+
+    print()
+    if deg < 20:
+        print("  ✓ Физика полностью самодостаточна!")
+        print("  ✓ Гипотеза подтверждена: физика восстанавливается без языка")
+    elif deg < 50:
+        print("  ~ Физика работает без языка с небольшой потерей качества")
+        print("  ~ Гипотеза частично подтверждена")
+    else:
+        print("  ✗ Сильная зависимость от языка")
+        print("  ✗ Нужно проверить архитектуру или увеличить число эпох")
+
+    return {
+        "with_lang": avg_with,
+        "without_lang": avg_zero,
+        "degradation": deg,
+    }
+
+
+# ─── Итоговый отчёт ───────────────────────────────────────────────────────────
+
+
+def print_final_report(exp1, exp2, exp3):
+    print("\n" + "=" * 60)
+    print("  ИТОГОВЫЙ ОТЧЁТ")
+    print("=" * 60)
+
+    best_mode = min(exp1, key=lambda m: exp1[m]["recovery_error"])
+
+    print("\n  Эксперимент 1 — симметрия голов:")
+    for mode, r in exp1.items():
+        tag = " ← ЛУЧШИЙ" if mode == best_mode else ""
+        print(f"    {mode:<15} recovery={r['recovery_error']:.4f}{tag}")
+
+    print("\n  Эксперимент 2 — устойчивость к corruption:")
+    print(f"    Деградация (случайный текст): {exp2['deg_random']:+.1f}%")
+    print(f"    Деградация (шум):             {exp2['deg_noise']:+.1f}%")
+
+    print("\n  Эксперимент 3 — zero-language:")
+    print(f"    Деградация без языка: {exp3['degradation']:+.1f}%")
+
+    print("\n  Выводы:")
+    conclusions = []
+    if best_mode == "alternating":
+        conclusions.append("✓ Симметричные головы эффективнее одностороннего подхода")
+    if exp2["deg_random"] < 30:
+        conclusions.append("✓ Физическое предсказание устойчиво к языковому шуму")
+    if exp3["degradation"] < 30:
+        conclusions.append("✓ Физика восстанавливается без языкового контекста")
+        conclusions.append("✓ Гипотеза об обратимой композиции подтверждена")
+
+    if conclusions:
+        for c in conclusions:
+            print(f"    {c}")
+    else:
+        print("    ~ Требуется дополнительное обучение или настройка")
+
+    print("=" * 60)
+
+
+# ─── Точка входа ──────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    # Подготовка данных
+    ann_file = prepare_annotations()
+    dataset = UCFDataset(ann_file, max_samples=MAX_SAMPLES)
+    loader = DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=(DEVICE == "cuda"),
+    )
+    print(f"  Батчей в эпохе: {len(loader)}")
+
+    # Эксперимент 1 — обучаем все три варианта
+    exp1 = experiment_1(loader)
+
+    # Выбираем лучшую модель для экспериментов 2 и 3
+    best_mode = min(exp1, key=lambda m: exp1[m]["recovery_error"])
+    best_model = DualPlaneWorldModel(mode=best_mode).to(DEVICE)
+    best_model.load_state_dict(
+        torch.load(f"{SAVE_PATH}/model_{best_mode}.pt", map_location=DEVICE)
+    )
+    best_model.eval()
+    print(f"\n  Используем лучшую модель [{best_mode}] для экспериментов 2 и 3")
+
+    # Эксперимент 2
+    exp2 = experiment_2(best_model, loader)
+
+    # Эксперимент 3
+    exp3 = experiment_3(best_model, loader)
+
+    # Финальный отчёт
+    print_final_report(exp1, exp2, exp3)
